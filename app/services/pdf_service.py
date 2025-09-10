@@ -56,6 +56,8 @@ class PDFIngestionService:
             store_text = os.getenv("STORE_CHUNK_TEXT") is not None
             chunk_text_field = os.getenv("CHUNK_TEXT_FIELD", "text")
             chunk_text_max = int(os.getenv("CHUNK_TEXT_MAX_CHARS", "1600"))
+            full_text_field = os.getenv("FULL_CHUNK_TEXT_FIELD", "text_full")
+            full_text_max = int(os.getenv("FULL_CHUNK_TEXT_MAX_CHARS", "8000"))
 
             pages_text = PDFUtils.extract_text_from_pages(pdf_path)
             fname = (metadata or {}).get('filename', os.path.basename(pdf_path))
@@ -96,8 +98,14 @@ class PDFIngestionService:
                         "_segments_total": len(page_segments),
                         "filename": fname
                     })
-                    if store_text:
-                        payload[chunk_text_field] = seg if len(seg) <= chunk_text_max else seg[:chunk_text_max] + "…"
+                    # Always include a truncated version in primary field
+                    truncated = seg if len(seg) <= chunk_text_max else seg[:chunk_text_max] + "…"
+                    payload[chunk_text_field] = truncated
+                    # Always store a (possibly length-limited) full field for retrieval context
+                    if len(seg) <= full_text_max:
+                        payload[full_text_field] = seg
+                    else:
+                        payload[full_text_field] = seg[:full_text_max] + "…"
                     segments.append((seg, payload))
 
             logger.info(f"Segmented PDF into {len(segments)} segments (pages={len(non_empty_pages)})")

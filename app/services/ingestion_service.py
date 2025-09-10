@@ -21,8 +21,7 @@ class IngestionService:
         - Stream CSV with pandas chunksize (INGEST_BATCH_SIZE env or default 64)
         - For each chunk, further adapt batch size on-the-fly if embedding triggers OOM / allocation errors.
         - ColBERT often the memory bottleneck; we progressively halve the batch until success (min 1).
-        - Logs progress every processed batch.
-        """
+    """
         # Batch & segmentation params (all inside method scope)
         base_batch_size = int(os.getenv("INGEST_BATCH_SIZE", "64"))
         target_tokens = int(os.getenv("CSV_CHUNK_TOKENS", "180"))
@@ -37,6 +36,8 @@ class IngestionService:
         store_text = os.getenv("STORE_CHUNK_TEXT") is not None
         chunk_text_field = os.getenv("CHUNK_TEXT_FIELD", "text")
         chunk_text_max = int(os.getenv("CHUNK_TEXT_MAX_CHARS", "1600"))
+        full_text_field = os.getenv("FULL_CHUNK_TEXT_FIELD", "text_full")
+        full_text_max = int(os.getenv("FULL_CHUNK_TEXT_MAX_CHARS", "8000"))
 
         processed_rows = 0
         total_segments = 0
@@ -83,15 +84,16 @@ class IngestionService:
                                 "_segment_index": seg_idx,
                                 "_segments_total": len(segs),
                                 "_original_row_index": processed_rows + row_offset,
+                                "filename": getattr(file, "filename", None) or getattr(file, "original_filename", None),
                             }
                         )
                         if store_text:
                             seg_payload[chunk_text_field] = seg if len(seg) <= chunk_text_max else seg[:chunk_text_max] + "…"
+                        seg_payload[full_text_field] = seg if len(seg) <= full_text_max else seg[:full_text_max] + "…"
                         texts.append(seg)
                         payloads.append(seg_payload)
                 total_segments += len(texts)
 
-                # Adaptive embedding/upsert
                 start = 0
                 current_batch_size = min(len(texts), base_batch_size)
                 while start < len(texts):

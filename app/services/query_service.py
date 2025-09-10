@@ -102,38 +102,54 @@ class QueryService:
         return None
 
     def _build_context(self, sources: List[Dict[str, Any]]) -> str:
-        """Build a clean, processed context from sources"""
+        """Build a clean, processed context from sources selecting the richest available text.
+
+        Preference order:
+        1. FULL_CHUNK_TEXT_FIELD (default 'text_full') if present
+        2. CHUNK_TEXT_FIELD (default 'text')
+        3. 'content' or 'raw_text' fallback
+        Each source truncated by CONTEXT_SOURCE_MAX_CHARS. Total context limited by CONTEXT_TOTAL_MAX_CHARS.
+        """
+        full_field = os.getenv("FULL_CHUNK_TEXT_FIELD", "text_full")
+        primary_field = os.getenv("CHUNK_TEXT_FIELD", "text")
+        per_source_cap = int(os.getenv("CONTEXT_SOURCE_MAX_CHARS", "1200"))
+        total_cap = int(os.getenv("CONTEXT_TOTAL_MAX_CHARS", "6000"))
+
         ctx_parts = []
-        seen_content = set()  # To avoid duplicate content
-        
+        seen_content = set()
+        total_len = 0
+
         for idx, s in enumerate(sources, 1):
-            text = s.get("text", "").strip()
-            filename = s.get("filename", "Unknown")
-            
-            # Skip empty or very short content
-            if not text or len(text) < 20:
+            raw = (
+                s.get(full_field)
+                or s.get(primary_field)
+                or s.get("content")
+                or s.get("raw_text")
+                or ""
+            )
+            text = (raw or "").strip()
+            if not text or len(text) < 15:
                 continue
-                
-            # Clean the text - remove excessive whitespace, brackets, quotes
             cleaned_text = self._clean_text(text)
-            
-            # Skip if cleaned text is too short or empty
-            if not cleaned_text or len(cleaned_text) < 10:
+            if not cleaned_text:
                 continue
-                
-            # Create a content signature to avoid near-duplicates
-            content_signature = cleaned_text[:100].lower().strip()
-            if content_signature in seen_content:
+            # Deduplicate by first 120 chars signature
+            sig = cleaned_text[:120].lower()
+            if sig in seen_content:
                 continue
-            seen_content.add(content_signature)
-            
-            # Create a clean context entry with better formatting
-            ctx_parts.append(f"**Source {idx}** ({filename}):\n{cleaned_text}")
-        
-        # If no good content found, return a note
+            seen_content.add(sig)
+            if len(cleaned_text) > per_source_cap:
+                cleaned_text = cleaned_text[:per_source_cap] + "…"
+            filename = s.get("filename", "Unknown")
+            entry = f"**Source {idx}** ({filename}):\n{cleaned_text}"
+            if total_len + len(entry) > total_cap:
+                # Stop adding more to keep prompt manageable
+                break
+            ctx_parts.append(entry)
+            total_len += len(entry)
+
         if not ctx_parts:
             return "No relevant content found in the documents."
-        
         return "\n\n".join(ctx_parts)
     
     def _clean_text(self, text: str) -> str:
@@ -196,8 +212,13 @@ class QueryService:
         if not q_words:
             return 0.5
         covered = 0
+        full_field = os.getenv("FULL_CHUNK_TEXT_FIELD", "text_full")
+        primary_field = os.getenv("CHUNK_TEXT_FIELD", "text")
         for w in q_words:
-            if any(w in (s.get('text','').lower()) for s in sources):
+            if any(
+                w in (s.get(full_field,'') or s.get(primary_field,'') or '').lower()
+                for s in sources
+            ):
                 covered += 1
         return min(covered / len(q_words), 1.0)
 
