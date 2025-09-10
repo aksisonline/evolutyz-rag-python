@@ -92,14 +92,19 @@ class FilesService:
             
             print(f"Found {total_points} points to delete for file: {filename}")
             
-            # Delete all points with this filename
+            # Build a proper Qdrant filter selector (previous dict caused Unsupported points selector type error)
+            filter_selector = models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="filename",
+                        match=models.MatchValue(value=filename)
+                    )
+                ]
+            )
+
             delete_result = self.client.delete(
                 collection_name=self.collection_name,
-                points_selector={
-                    "filter": {
-                        "must": [{"key": "filename", "match": {"value": filename}}]
-                    }
-                }
+                points_selector=models.FilterSelector(filter=filter_selector)
             )
             
             print(f"Delete operation completed for file: {filename}")

@@ -1,8 +1,13 @@
 
 import os
+import time
+from typing import List
 from qdrant_client import QdrantClient, models
-from typing import List, Dict, Any, Optional
 from app.utils.logging_config import logger
+try:
+    import httpx  # for exception types
+except Exception:  # pragma: no cover
+    httpx = None
 
 class QdrantClientWrapper:
     def __init__(self):
@@ -61,29 +66,70 @@ class QdrantClientWrapper:
                 logger.warning(f"Could not create index on 'filename' field: {e}")
 
     def upsert_hybrid_batch(self, dense_vectors, sparse_vectors, colbert_vectors, payloads):
-        # Each colbert_vectors[i] is a list of token vectors for document i
+        """Upsert a batch of hybrid (dense+sparse+ColBERT) vectors with safe sub-batching & retries.
+
+        Environment variables:
+        - QDRANT_MAX_POINTS_PER_UPSERT (int, default 16)
+        - QDRANT_UPSERT_RETRIES (int, default 3)
+        - QDRANT_UPSERT_BACKOFF_BASE (float seconds, default 0.5)
+        - QDRANT_DISABLE_COLBERT (bool flag) -> if set, omit ColBERT vectors
+        """
         from qdrant_client.models import PointStruct
         import uuid
-        points = []
-        for i, (dense, sparse, colbert, payload) in enumerate(zip(dense_vectors, sparse_vectors, colbert_vectors, payloads)):
+
+        max_points = int(os.getenv("QDRANT_MAX_POINTS_PER_UPSERT", "16"))
+        retries = int(os.getenv("QDRANT_UPSERT_RETRIES", "3"))
+        backoff_base = float(os.getenv("QDRANT_UPSERT_BACKOFF_BASE", "0.5"))
+        disable_colbert = os.getenv("QDRANT_DISABLE_COLBERT") is not None
+
+        # Build full point list first
+        points: List[PointStruct] = []
+        for dense, sparse, colbert, payload in zip(dense_vectors, sparse_vectors, colbert_vectors, payloads):
+            vector_payload = {
+                "all-MiniLM-L6-v2": dense,
+                "bm25": sparse.as_object() if hasattr(sparse, 'as_object') else sparse,
+            }
+            if not disable_colbert:
+                vector_payload["colbertv2.0"] = colbert
             points.append(PointStruct(
-                id=str(uuid.uuid4()),  # Generate unique ID
-                vector={
-                    "all-MiniLM-L6-v2": dense,
-                    "bm25": sparse.as_object() if hasattr(sparse, 'as_object') else sparse,
-                    "colbertv2.0": colbert
-                },
+                id=str(uuid.uuid4()),
+                vector=vector_payload,
                 payload=payload
             ))
-        try:
-            self.client.upsert(
-                collection_name=self.collection_name,
-                points=points
-            )
-            logger.info(f"Upserted {len(points)} hybrid points into '{self.collection_name}'.")
-        except Exception as e:
-            logger.error(f"Failed to upsert hybrid points: {e}")
-            raise
+
+        if not points:
+            logger.warning("No points to upsert (empty batch).")
+            return
+
+        # Iterate in sub-batches to avoid large payload disconnects
+        total = len(points)
+        idx = 0
+        while idx < total:
+            sub = points[idx: idx + max_points]
+            attempt = 0
+            while True:
+                try:
+                    self.client.upsert(collection_name=self.collection_name, points=sub)
+                    logger.info(f"Upserted {len(sub)} points ({idx + len(sub)}/{total}) into '{self.collection_name}'.")
+                    break
+                except Exception as e:  # network / protocol / timeout / server disconnect
+                    attempt += 1
+                    is_protocol = "disconnected" in str(e).lower() or "protocol" in str(e).lower()
+                    transient = is_protocol or (httpx and isinstance(e, (httpx.RemoteProtocolError, httpx.TimeoutException)))
+                    if attempt < retries and transient:
+                        sleep_time = backoff_base * (2 ** (attempt - 1))
+                        logger.warning(f"Transient upsert failure (attempt {attempt}/{retries}) for sub-batch size {len(sub)}: {e}. Backing off {sleep_time:.2f}s")
+                        time.sleep(sleep_time)
+                        # If repeated failures, shrink sub-batch dynamically
+                        if len(sub) > 1 and attempt > 1:
+                            new_size = max(1, len(sub) // 2)
+                            if new_size < len(sub):
+                                logger.warning(f"Reducing sub-batch from {len(sub)} to {new_size} due to repeated failures")
+                                sub = sub[:new_size]
+                        continue
+                    logger.error(f"Failed to upsert hybrid points after {attempt} attempts: {e}")
+                    raise
+            idx += len(sub)
 
     def query_hybrid_with_rerank(self, dense_query, sparse_query, colbert_query, filters, top_k):
         from qdrant_client import models
