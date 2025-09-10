@@ -1,0 +1,9 @@
+fastembed
+fastapi
+qdrant-client
+sentence-transformers
+pandas
+uvicorn
+python-dotenv
+hf_xet
+python-multipart

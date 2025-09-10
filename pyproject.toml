@@ -1,0 +1,22 @@
+[project]
+name = "rag-python"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.9"
+
+dependencies = [
+	"fastapi",
+	"qdrant-client",
+	"pandas",
+	"qdrant-client[fastembed]",
+	"google-genai",
+	"colpali_engine>=0.3.1",
+	"PyPDF2",
+	"torch",
+	"python-multipart",
+	"python-dotenv",
+	"uvicorn",
+	"hf_xet",
+	
+]
