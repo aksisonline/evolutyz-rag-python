@@ -38,9 +38,18 @@ async def stream_rag(request: Request):
     query_req = QueryRequest(**body)
 
     async def token_stream():
-        # Use Gemini streaming if available, else fallback to full answer
+        # Stream chunks; ensure each newline becomes a separate SSE data line per spec
         for chunk in query_service.stream_answer(query_req):
-            yield f"data: {chunk}\n\n"
+            if chunk is None:
+                continue
+            # Normalize Windows line endings
+            chunk = chunk.replace('\r\n', '\n')
+            lines = chunk.split('\n')
+            for i, line in enumerate(lines):
+                # Preserve empty lines explicitly
+                yield f"data: {line}\n"
+            # Event terminator
+            yield "\n"
             await asyncio.sleep(0)  # Yield control to event loop
 
     return StreamingResponse(token_stream(), media_type="text/event-stream")

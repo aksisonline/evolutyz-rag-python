@@ -94,7 +94,32 @@ class QdrantClientWrapper:
         
         try:
             # Check if ColBERT query is available and valid
-            if colbert_query and len(colbert_query) > 0:
+            valid_colbert = False
+            colbert_len = None
+            try:
+                if colbert_query is not None:
+                    # Support numpy arrays, lists, tuples
+                    if hasattr(colbert_query, 'shape'):
+                        # numpy ndarray
+                        import numpy as np  # local import to avoid hard dependency elsewhere
+                        if isinstance(colbert_query, np.ndarray):
+                            colbert_len = colbert_query.shape[0]
+                            # Convert to list-of-lists if ndarray for Qdrant
+                            if colbert_query.dtype != object:
+                                colbert_query = colbert_query.tolist()
+                        else:
+                            # Fallback length
+                            colbert_len = len(colbert_query) if hasattr(colbert_query, '__len__') else None
+                    else:
+                        colbert_len = len(colbert_query) if hasattr(colbert_query, '__len__') else None
+                    valid_colbert = colbert_len is not None and colbert_len > 0
+            except Exception as conv_err:
+                logger.warning(f"ColBERT query inspection/conversion failed, falling back to dense-only: {conv_err}")
+                valid_colbert = False
+
+            logger.debug(f"ColBERT query validity: {valid_colbert}; length: {colbert_len}; type: {type(colbert_query)}")
+
+            if valid_colbert:
                 # Use ColBERT reranking if available
                 results = self.client.query_points(
                     collection_name=self.collection_name,
@@ -108,7 +133,7 @@ class QdrantClientWrapper:
                 logger.info(f"Hybrid query with ColBERT returned {len(results.points)} results.")
             else:
                 # Fallback to dense-only query when ColBERT is not available
-                logger.warning("ColBERT query is empty, using dense-only search")
+                logger.warning("ColBERT query not usable (None or empty), using dense-only search")
                 results = self.client.query_points(
                     collection_name=self.collection_name,
                     query=dense_query,
