@@ -395,8 +395,23 @@ class QueryService:
             
             # Add evaluation metrics at the end
             yield f"\n\n---\n**📊 Response Quality Metrics:**\n"
+            # Unique filenames among returned points (files actually contributing)
+            unique_files = []
+            seen_files = set()
+            for s in sources:
+                fn = s.get('filename') or 'Unknown'
+                if fn not in seen_files:
+                    seen_files.add(fn)
+                    unique_files.append(fn)
+            # Prepare file listing (truncate if extremely long)
+            max_list_files = int(os.getenv('METRICS_MAX_FILE_LIST', '12'))
+            display_files = unique_files[:max_list_files]
+            files_list_str = ', '.join(display_files)
+            if len(unique_files) > max_list_files:
+                files_list_str += ', …'
             yield f"• **Retrieval Quality:** {eval_metrics.avg_retrieval_score:.3f} (avg), {eval_metrics.max_retrieval_score:.3f} (max)\n"
-            yield f"• **Sources Used:** {eval_metrics.num_sources_used} documents\n"
+            yield f"• **Result Points Returned:** {eval_metrics.num_sources_used} segments\n"
+            yield f"• **Source Files Used:** {len(unique_files)} files ({files_list_str})\n"
             yield f"• **Confidence:** {eval_metrics.confidence_score:.3f}/1.0\n"
             yield f"• **Coverage:** {eval_metrics.coverage_score:.3f}/1.0\n"
             yield f"• **Source Diversity:** {eval_metrics.source_diversity:.3f}/1.0\n"
