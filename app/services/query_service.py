@@ -291,13 +291,15 @@ class QueryService:
             return (f"I can't answer '{question}' yet because no documents are available. Upload/select some and ask again.", "No documents available")
         context_block = self._build_context(sources)
         style = self._determine_answer_style(question)
+        system_instruction = self._system_instruction(style)
         prompt = (
-            "You are IRA (Information Retrieval Assistant). Use ONLY the provided sources.\n"
+            f"{system_instruction}\n"
             f"Question: {question}\n"
             f"Answer style directive: {style['instructions']}\n"
             f"Hard word limit: {style['max_words']} words. Do not exceed.\n"
-            "If information is missing in sources, say you don't have that detail.\n\n"
-            f"Sources:\n{context_block}\n\nAnswer:" )
+            "If a fact is not present verbatim in the sources, state that it's not available instead of guessing.\n"
+            "Never invent names or people not explicitly present.\n\n"
+            f"Sources (verbatim snippets):\n{context_block}\n\nAnswer:" )
         try:
             chat = self.llm_client.chats.create(model="gemini-2.5-flash")
             stream = chat.send_message_stream(prompt)
@@ -357,13 +359,17 @@ class QueryService:
                 return
             
             context_block = self._build_context(sources)
+            style = self._determine_answer_style(request.question)
+            system_instruction = self._system_instruction(style)
             prompt = (
-                "You are IRA (Information Retrieval Assistant). Answer using ONLY the sources. Preserve original newline formatting.\n"
+                f"{system_instruction}\n"
                 f"Question: {request.question}\n"
-                f"Answer style directive: {self._determine_answer_style(request.question)['instructions']}\n"
-                f"Hard word limit: {self._determine_answer_style(request.question)['max_words']} words.\n"
-                "If question is brief, respond with a single concise layman sentence. If detailed, give a succinct structured answer without fluff.\n\n"
-                f"Sources:\n{context_block}\n\nAnswer:" )
+                f"Answer style directive: {style['instructions']}\n"
+                f"Hard word limit: {style['max_words']} words.\n"
+                "If question is brief, respond with a single concise layman sentence. If detailed, give a succinct structured answer without fluff.\n"
+                "If a detail (like a teammate name) is not in sources, explicitly say it's not specified in the provided documents.\n"
+                "Do NOT hallucinate names, numbers, dates, or attributions.\n\n"
+                f"Sources (verbatim snippets):\n{context_block}\n\nAnswer:" )
             chat = self.llm_client.chats.create(model="gemini-2.5-flash")
             stream = chat.send_message_stream(prompt)
             chunk_count = 0
@@ -418,3 +424,21 @@ class QueryService:
         except Exception as e:
             logger.warning(f"Streaming LLM answer failed: {e}")
             yield f"I apologize, but I encountered an error while processing your request: {str(e)}"
+
+    # --- System instruction -----------------------------------------------------------
+    def _system_instruction(self, style: Dict[str, Any]) -> str:
+        """Return a single authoritative system instruction for IRA.
+
+        IRA = Information Resource Assistant (short form). Principles:
+        - Only use provided source snippets; do not rely on outside knowledge.
+        - Never fabricate people, teammates, or entities not present in sources.
+        - Be concise; obey supplied max word limit strictly.
+        - Preserve essential formatting (lists/newlines in answers if they add clarity).
+        - If info is missing: explicitly say it's not specified in the provided sources.
+        - Avoid hedging filler ("It seems", "Perhaps"). Prefer direct language.
+        - No markdown headers unless clearly beneficial; light formatting (bullets, bold key terms) allowed within word limit.
+        """
+        # Could allow ENV override later
+        return (
+            "You are IRA (Information Resource Assistant). A focused retrieval QA agent that strictly grounds every statement in the supplied source snippets."
+        )
