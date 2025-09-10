@@ -47,6 +47,11 @@ class QueryService:
             
             results = self.qdrant.query_hybrid_with_rerank(dense_query, sparse_query, colbert_query, qdrant_filters, request.top_k)
             sources = [r.payload for r in results]
+
+            # Handle meta identity questions directly (do not force document grounding)
+            if self._is_meta_identity_question(request.question):
+                answer = self._identity_answer()
+                return QueryResponse(answer=answer, sources=[], reasoning="Meta identity response (no document grounding required)")
             
             # Calculate evaluation metrics
             eval_metrics = self._calculate_evaluation_metrics(request.question, results, sources)
@@ -284,6 +289,9 @@ class QueryService:
         if not self.llm_client:
             return ("LLM not configured. Provide GOOGLE API credentials to enable answer synthesis.",
                     "No reasoning available (LLM disabled).")
+        # Identity / meta question shortcut (avoid hallucination constraint conflict)
+        if self._is_meta_identity_question(question):
+            return (self._identity_answer(), "Meta identity response")
         if not sources:
             ql = question.lower()
             if any(g in ql for g in ['hi','hello','hey','good morning','good afternoon','good evening']):
@@ -340,6 +348,11 @@ class QueryService:
             
             results = self.qdrant.query_hybrid_with_rerank(dense_query, sparse_query, colbert_query, qdrant_filters, request.top_k)
             sources = [r.payload for r in results]
+
+            # Meta identity question bypass: respond directly without LLM (or with minimal)
+            if self._is_meta_identity_question(request.question):
+                yield self._identity_answer()
+                return
             
             # Calculate evaluation metrics
             eval_metrics = self._calculate_evaluation_metrics(request.question, results, sources)
@@ -441,4 +454,20 @@ class QueryService:
         # Could allow ENV override later
         return (
             "You are IRA (Information Resource Assistant). A focused retrieval QA agent that strictly grounds every statement in the supplied source snippets."
+        )
+
+    # --- Meta identity detection ------------------------------------------------------
+    def _is_meta_identity_question(self, question: str) -> bool:
+        if not question:
+            return False
+        q = question.strip().lower()
+        triggers = [
+            "who are you", "your name", "what is your name", "who am i talking", "who am i speaking", "introduce yourself",
+            "what are you", "are you a bot", "who is ira"
+        ]
+        return any(t in q for t in triggers)
+
+    def _identity_answer(self) -> str:
+        return (
+            "I'm IRA (Information Resource Assistant), your retrieval QA assistant. I ground answers in selected documents; for general or meta questions like this I reply directly."
         )
