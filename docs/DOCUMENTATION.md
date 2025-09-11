@@ -1,45 +1,72 @@
-## Qdrant RAG Pipeline Documentation
+## Qdrant RAG Pipeline - Technical Documentation
 
-### Overview
+### Executive Summary
 
-This project implements a modular, production-quality Retrieval-Augmented Generation (RAG) pipeline using FastAPI, Qdrant, and ColBERT-style multivector reranking (dense + late interaction). The codebase is organized for scalability and maintainability, following OOP and best practices.
+This project implements an enterprise-grade Retrieval-Augmented Generation (RAG) pipeline featuring advanced hybrid search, intelligent query routing, and production optimizations. Built with FastAPI and Qdrant, it provides state-of-the-art document intelligence capabilities with automatic summary enhancement and smart result diversification.
 
-**Hybrid search and reranking is fully implemented:**
+### Core Innovation
 
-- The pipeline uses Qdrant's `query_points` with `prefetch` for both dense (semantic) and sparse (BM25/keyword) retrieval, followed by ColBERT (late-interaction) reranking for every query.
-- ColBERT token-level vectors are used for reranking the hybrid-retrieved candidates, ensuring high-precision semantic matching.
+**Advanced Multi-Vector Architecture:**
+- **Hybrid Search**: Combines dense semantic vectors, sparse keyword matching, and ColBERT late-interaction reranking
+- **Summary Enhancement**: Automatic detection and 3x result expansion for comprehensive queries
+- **Smart Diversification**: Cross-file result distribution for better coverage
+- **Function Calling**: Intelligent routing between RAG and direct responses
 
-### Hybrid RAG Pipeline: Step-by-Step Flow
+**Production-Ready Features:**
+- Memory-efficient adaptive batching to prevent OOM errors
+- Singleton pattern for embedding model reuse
+- Comprehensive error handling and logging
+- Real-time streaming with multiple endpoint options
 
-1. **Data Ingestion**
+### Enhanced Hybrid RAG Pipeline: Technical Deep Dive
 
-   - User uploads a CSV via the API.
-   - Backend parses each row, dynamically creates a payload from all columns (schema-flexible).
-   - Text columns are concatenated for embedding.
-   - For each row, three types of embeddings are generated:
-     - Dense (semantic, e.g., MiniLM)
-     - Sparse (BM25/keyword)
-     - ColBERT (token-level, late interaction)
-   - Qdrant upserts: each point contains all three vector types and full payload metadata (batch operation).
-2. **Query Processing**
+**1. Advanced Document Ingestion**
 
-   - User submits a question via the API.
-   - Backend encodes the query as dense, sparse, and ColBERT embeddings.
-3. **Hybrid Retrieval & Reranking**
+   - **Multi-Format Support**: CSV with dynamic schema detection + PDF with ColPali visual processing
+   - **Intelligent Chunking**: Token-based segmentation (180 tokens) with configurable overlap and hard limits (512 max)
+   - **Dynamic Segmentation**: Content-aware chunking that adapts to document structure (optional)
+   - **Memory-Safe Processing**: Adaptive batching that automatically reduces batch size on OOM errors
+   - **Three-Vector Generation**: For each chunk, generates:
+     - Dense vectors (384d, semantic similarity via MiniLM)
+     - Sparse vectors (BM25/keyword matching via Qdrant)
+     - ColBERT multivectors (128d per token, late interaction)
+   - **Metadata Preservation**: Full payload retention including filename indexing for efficient filtering
+   - **Batch Upsert**: Optimized bulk operations with retry logic and exponential backoff
 
-   - Qdrant performs hybrid retrieval using both dense (semantic) and sparse (BM25) vectors via `prefetch`.
-   - The top candidates are reranked using ColBERT token-level late interaction (MaxSim comparator).
-   - Supports arbitrary metadata filtering via payload.
-   - Returns top-k ranked items with all payload metadata.
-4. **Context Augmentation & LLM Generation**
+**2. Intelligent Query Processing**
 
-   - Backend compiles retrieved contexts and aggregates relevant payload fields.
-   - Builds an augmented prompt for Gemini 2.5 Flash (if enabled) with guidelines for concise responses (150-200 words max).
-   - LLM generates concise, well-structured answers with proper formatting, reasoning, and source citations (streamed if supported).
-5. **Response**
+   - **Function Calling Integration**: LLM-based routing that decides when RAG retrieval is needed
+   - **Local Routing**: Fast-path handling for greetings and identity queries (if enabled)
+   - **Summary Detection**: Automatic identification of comprehensive queries using pattern matching
+   - **Query Embedding**: Same three-vector approach as documents for optimal matching
+   - **Adaptive Parameters**: Dynamic top_k adjustment based on query type and intent
+**3. Advanced Hybrid Retrieval & Reranking**
 
-   - API returns the answer, reasoning, and sources to the frontend.
-   - (Optional) Streaming endpoint can be used for real-time answer delivery.
+   - **Prefetch Stage**: Qdrant performs hybrid retrieval using both dense (semantic) and sparse (BM25) vectors
+   - **Initial Filtering**: Fast vector similarity search returns top candidates (typically 2-3x final count)
+   - **ColBERT Reranking**: Token-level late interaction using MaxSim comparator for precision
+   - **Smart Diversification**: For summary queries, applies intelligent cross-file result distribution
+   - **Score Fusion**: Combines multiple vector similarity scores into unified ranking
+   - **Metadata Filtering**: Supports arbitrary payload-based filtering (filename, tags, etc.)
+   - **Quality Assurance**: Returns top-k ranked items with complete source attribution
+
+**4. Enhanced Context Augmentation & LLM Generation**
+
+   - **Context Compilation**: Aggregates retrieved content with relevance scores and source metadata
+   - **Summary Enhancement**: For detected summary queries, uses specialized system instructions
+   - **Prompt Engineering**: Constructs optimized prompts with guidelines for response style and length
+   - **Gemini Integration**: Utilizes Google Gemini 2.5 Flash for high-quality answer generation
+   - **Streaming Support**: Real-time token generation with multiple endpoint options (/stream, /stream-auto)
+   - **Source Attribution**: Maintains provenance tracking for fact verification and citations
+   - **Response Formatting**: Structured output with proper markdown, lists, and source references
+
+**5. Production-Ready Response & Monitoring**
+
+   - **Multi-Format Delivery**: Synchronous JSON responses and streaming server-sent events
+   - **Performance Metrics**: Comprehensive timing, source count, and quality indicators
+   - **Error Handling**: Graceful degradation with detailed error reporting
+   - **Health Monitoring**: Built-in endpoints for system status and resource usage
+   - **Logging**: Structured logging with request tracing and performance analytics
 6. **Ops & Monitoring**
 
    - All ingestion and query operations are logged.
