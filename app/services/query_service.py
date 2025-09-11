@@ -2,12 +2,146 @@ from app.utils.qdrant_client import QdrantClientWrapper
 from app.utils.colbert_embedder import ColBERTEmbedder
 from app.models.query import QueryRequest, QueryResponse, EvaluationMetrics
 from app.utils.logging_config import logger
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional, Generator
 import os
 import numpy as np
 
 from google import genai
 from google.genai import types as genai_types
+
+# Module-level singletons for function calling tool reuse
+_RAG_EMBEDDER: Optional[ColBERTEmbedder] = None
+_RAG_QDRANT: Optional[QdrantClientWrapper] = None
+
+def _get_rag_components():
+    global _RAG_EMBEDDER, _RAG_QDRANT
+    if _RAG_EMBEDDER is None:
+        _RAG_EMBEDDER = ColBERTEmbedder()
+    if _RAG_QDRANT is None:
+        _RAG_QDRANT = QdrantClientWrapper()
+    return _RAG_EMBEDDER, _RAG_QDRANT
+
+def rag_search(question: str, top_k: int = 5, selected_files: Optional[List[str]] = None) -> Dict:
+    """Retrieve relevant document segments for grounding an answer.
+
+    Args:
+        question: Natural language user query requiring factual lookup.
+        top_k: Maximum number of segments to return (default 5).
+        selected_files: Optional list of filenames to constrain search scope.
+
+    Returns:
+        Dict containing:
+          question: Original question
+          segments: List[{filename, score, page, text, text_full?}]
+          files: Distinct filenames represented
+          num_segments: Number of segments returned
+          unique_files: Number of distinct files
+
+    Notes:
+        The calling model MUST ground factual claims only in returned segment text. If a fact (e.g., email, teammate name) is absent, state it is not specified.
+        For summary-like queries with higher top_k, attempts to diversify results across different source files.
+    """
+    try:
+        embedder, qdrant = _get_rag_components()
+        dense_q = embedder.embed_dense_query(question)
+        sparse_q = embedder.embed_sparse_query(question)
+        colbert_q = embedder.embed_colbert_query(question)
+
+        # Build optional filter
+        qdrant_filter = None
+        if selected_files:
+            from qdrant_client import models
+            qdrant_filter = models.Filter(
+                should=[
+                    models.FieldCondition(key="filename", match=models.MatchValue(value=f))
+                    for f in selected_files if f
+                ]
+            )
+        
+        # For better diversity, especially on summary queries, retrieve more results initially
+        # then post-process for diversity if top_k is high (indicating summary request)
+        initial_k = max(top_k, top_k * 2) if top_k > 10 else top_k
+        
+        results = qdrant.query_hybrid_with_rerank(dense_q, sparse_q, colbert_q, qdrant_filter, initial_k)
+        
+        # Apply diversity filtering if we retrieved more than requested (summary mode)
+        if len(results) > top_k and top_k > 10:
+            # Diversify results to ensure better file coverage
+            results = _diversify_results_by_file(results, top_k)
+        
+        chunk_field = os.getenv("CHUNK_TEXT_FIELD", "text")
+        full_field = os.getenv("FULL_CHUNK_TEXT_FIELD", "text_full")
+        segs = []
+        for r in results:
+            payload = r.payload or {}
+            seg = {
+                "filename": payload.get("filename", "Unknown"),
+                "score": getattr(r, "score", 0.0),
+                "page": payload.get("page"),
+                "text": payload.get(chunk_field, "")
+            }
+            if payload.get(full_field):
+                seg[full_field] = payload.get(full_field)
+            segs.append(seg)
+        files = list({s["filename"] for s in segs})
+        return {
+            "question": question,
+            "segments": segs,
+            "files": files,
+            "num_segments": len(segs),
+            "unique_files": len(files)
+        }
+    except Exception as e:
+        logger.warning(f"rag_search tool failure: {e}")
+        return {"question": question, "segments": [], "files": [], "num_segments": 0, "unique_files": 0, "error": str(e)}
+
+
+def _diversify_results_by_file(results, target_k: int):
+    """Diversify search results to ensure better coverage across different files.
+    
+    Args:
+        results: List of search results with .payload containing filename
+        target_k: Target number of results to return
+        
+    Returns:
+        Diversified list of results with better file distribution
+    """
+    if not results or len(results) <= target_k:
+        return results
+    
+    # Group results by filename
+    by_file = {}
+    for result in results:
+        filename = result.payload.get("filename", "Unknown") if result.payload else "Unknown"
+        if filename not in by_file:
+            by_file[filename] = []
+        by_file[filename].append(result)
+    
+    # If we have more files than target_k, take best result from each file first
+    diversified = []
+    files_used = set()
+    
+    # First pass: take the best result from each file
+    for filename, file_results in by_file.items():
+        if len(diversified) < target_k:
+            # Take the highest scoring result from this file
+            best_result = max(file_results, key=lambda r: getattr(r, 'score', 0.0))
+            diversified.append(best_result)
+            files_used.add(filename)
+            file_results.remove(best_result)  # Remove it so we don't pick it again
+    
+    # Second pass: fill remaining slots with best remaining results
+    remaining_results = []
+    for filename, file_results in by_file.items():
+        remaining_results.extend(file_results)
+    
+    # Sort remaining by score and take the best ones
+    remaining_results.sort(key=lambda r: getattr(r, 'score', 0.0), reverse=True)
+    
+    slots_remaining = target_k - len(diversified)
+    diversified.extend(remaining_results[:slots_remaining])
+    
+    return diversified
 
 
 class QueryService:
@@ -22,6 +156,247 @@ class QueryService:
                 logger.warning(f"Gemini client init failed: {e}")
 
 
+    def is_available(self) -> bool:
+        """Check if LLM service is available."""
+        return self.llm_client is not None
+
+    # ------------------------------------------------------------------
+    # Function calling entry points
+    # ------------------------------------------------------------------
+    def auto_answer(self, question: str, selected_files: Optional[List[str]] = None, top_k: int = 5) -> str:
+        """Use Gemini automatic function calling so the model decides whether to invoke RAG.
+
+        The model should:
+        - Call rag_search when the user asks for factual / document-grounded info.
+        - Avoid calling the tool for pure greetings, meta identity, or chit‑chat; respond directly.
+        - If tool output lacks an answer to a detail (e.g., an email), explicitly state it is not specified.
+        - For summary requests, use enhanced diversity and more results.
+        """
+        if not self.is_available():
+            return "LLM not configured."
+        
+        # Detect summary requests and enhance top_k for better diversity
+        is_summary = self._is_summary_request(question)
+        effective_top_k = self._get_enhanced_top_k_for_summary(top_k) if is_summary else top_k
+        
+        style = self._classify_answer_style(question)
+        
+        # Enhanced system instruction for summary requests
+        base_instruction = (
+            "You are IRA (Information Resource Assistant). Decide whether the user question needs document grounding.\n"
+            "Call rag_search ONLY if factual content from documents is required to answer.\n"
+            "If greeting / small talk / identity question: respond directly, no tool call.\n"
+            "If you call rag_search, base every fact strictly on its segments; do not invent missing data.\n"
+            "If a requested fact (like colleague names, emails) is absent, say it is not specified in the provided documents.\n"
+        )
+        
+        if is_summary:
+            summary_instruction = (
+                "SUMMARY MODE DETECTED: The user is asking for a summary or overview. When you call rag_search:\n"
+                "- Synthesize information from multiple diverse sources\n" 
+                "- Highlight key themes and topics across different documents\n"
+                "- Organize information logically with clear structure\n"
+                "- Include insights from as many different source files as possible\n"
+                "- Use bullet points or numbered lists for clarity when presenting multiple points\n"
+            )
+            system_instruction = base_instruction + summary_instruction
+        else:
+            system_instruction = base_instruction
+            
+        system_instruction += (
+            "If the user explicitly asks to list / show / table / compare items (keywords: list, show, table, compare, enumerate, all X), and the retrieved segments contain 3 or more distinct items with consistent fields (e.g., filename, page, score, or clearly parallel bullet-worthy attributes), present them as a compact markdown table. One row per item, concise headers. If fewer than 3 structured items or fields are inconsistent, use a short bullet list instead. Never fabricate rows.\n"
+            "TABLE FORMAT (when used): each row MUST be on its own line; header line; separator line using pipes and dashes; no blank pipes; never collapse rows into one line; do not use HTML.\n"
+            f"Default to brevity. Style: {style['label']} (max {style['max_words']} words). Only produce a longer, detailed answer when the user explicitly requests depth with words like 'detailed', 'elaborate', 'step by step', 'in depth', 'comprehensive'.\n"
+            f"Answer directive: {style['directive']}"
+        )
+        
+        # Provide tool with bound selected_files by partial application pattern via closure wrapper
+        def rag_search_bound(question: str, top_k: int = effective_top_k) -> Dict:
+            return rag_search(question=question, top_k=top_k, selected_files=selected_files)
+        try:
+            resp = self.llm_client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=question,
+                config=genai_types.GenerateContentConfig(
+                    tools=[rag_search_bound],
+                    system_instruction=system_instruction,
+                ),
+            )
+            return (resp.text or "") if resp else ""
+        except Exception as e:
+            logger.warning(f"auto_answer failed: {e}")
+            return "Answer generation failed."
+
+    def auto_answer_stream(self, question: str, selected_files: Optional[List[str]] = None, top_k: int = 5) -> Generator[str, None, None]:
+        """Streaming variant of auto_answer using Gemini function calling.
+
+        Emits text chunks as they arrive. If the SDK/tool call pathway doesn't stream intermediate
+        tokens (depends on SDK version), falls back to single response emission.
+        Enhanced for summary requests with better diversity.
+        """
+        if not self.is_available():
+            yield "LLM not configured."
+            return
+
+        # Lightweight chit-chat / identity bypass (avoid latency and tool invocation)
+        if self._is_identity_q(question):
+            yield "I'm IRA (Information Resource Assistant). Ask a question and I'll decide whether to consult your documents."
+            return
+        if self._is_chitchat(question):
+            yield "Hi! I'm IRA. Ask something that might need your documents if you want a grounded answer."
+            return
+
+        # Detect summary requests and enhance top_k for better diversity
+        is_summary = self._is_summary_request(question)
+        effective_top_k = self._get_enhanced_top_k_for_summary(top_k) if is_summary else top_k
+        
+        style = self._classify_answer_style(question)
+        
+        # Enhanced system instruction for summary requests
+        base_instruction = (
+            "You are IRA (Information Resource Assistant). Decide whether the user question needs document grounding.\n"
+            "Call rag_search ONLY if factual document content is required.\n"
+            "If greeting / small talk / identity: respond directly without calling rag_search.\n"
+            "When rag_search is called, ground every fact strictly in returned segment text.\n"
+            "If a requested fact is absent, state it is not specified in the provided documents.\n"
+        )
+        
+        if is_summary:
+            summary_instruction = (
+                "SUMMARY MODE DETECTED: The user is asking for a summary or overview. When you call rag_search:\n"
+                "- Synthesize information from multiple diverse sources\n" 
+                "- Highlight key themes and topics across different documents\n"
+                "- Organize information logically with clear structure\n"
+                "- Include insights from as many different source files as possible\n"
+                "- Use bullet points or numbered lists for clarity when presenting multiple points\n"
+                "- Provide a comprehensive view that draws from the breadth of available sources\n"
+            )
+            system_instruction = base_instruction + summary_instruction
+        else:
+            system_instruction = base_instruction
+            
+        system_instruction += (
+            "If the user asks to list / show / table / compare (keywords: list, show, table, compare, enumerate, all <noun>), and ≥3 structured items with similar fields are present, output a concise markdown table (header + rows). Otherwise prefer a brief bullet list. Do not fabricate rows or columns.\n"
+            "TABLE FORMAT (when used): each row on its own line; header then separator; no double pipes from row merges; never join multiple rows into a single line.\n"
+            f"Default to concise output. Style: {style['label']} (max {style['max_words']} words). Only expand if the user explicitly asked for detail.\n"
+            f"Answer directive: {style['directive']}"
+        )
+        
+        last_tool_result: Dict[str, Any] = {}
+        def rag_search_bound(question: str, top_k: int = effective_top_k) -> Dict:
+            result = rag_search(question=question, top_k=top_k, selected_files=selected_files)
+            # Store for metrics after streaming
+            last_tool_result["result"] = result
+            return result
+
+        try:
+            # Attempt streaming; if SDK does not support streaming for function calling we catch and fallback
+            stream = self.llm_client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=question,
+                config=genai_types.GenerateContentConfig(
+                    tools=[rag_search_bound],
+                    system_instruction=system_instruction,
+                ),
+                stream=True,
+            )
+            collected_any = False
+            line_buffer = ""
+            chunk_count = 0
+            for chunk in stream:
+                text_part = getattr(chunk, "text", None)
+                if not text_part:
+                    continue
+                collected_any = True
+                chunk_count += 1
+                newline_count = text_part.count('\n')
+                logger.info(
+                    f"LLM Chunk {chunk_count}: repr={repr(text_part)} | has_newlines={newline_count>0} | newline_count={newline_count}"
+                )
+                # Accumulate with any prior partial line
+                combined = line_buffer + text_part
+                lines = combined.split('\n')
+                # Keep last segment (may be partial if original chunk had no trailing newline)
+                line_buffer = lines.pop()  # last element
+                for line in lines:
+                    out_line = line + '\n'
+                    if os.getenv('RAG_DEBUG_MARK_NEWLINES'):
+                        out_line = out_line.replace('\n', '⏎\n')
+                    yield out_line
+            # Flush any remaining buffered partial line
+            if line_buffer:
+                final_line = line_buffer
+                if os.getenv('RAG_DEBUG_MARK_NEWLINES'):
+                    final_line = final_line + '⏎'
+                yield final_line
+            if not collected_any:  # fallback (SDK gave no streaming text)
+                # Fallback full response call
+                resp = self.llm_client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=question,
+                    config=genai_types.GenerateContentConfig(
+                        tools=[rag_search_bound],
+                        system_instruction=system_instruction,
+                    ),
+                )
+                yield (resp.text or "") if resp else ""
+            # Append metrics if tool used
+            if "result" in last_tool_result:
+                result = last_tool_result["result"] or {}
+                segments = result.get("segments", []) or []
+                if segments:
+                    # Compute lightweight metrics similar to existing QueryService
+                    scores = [s.get("score", 0.0) for s in segments if isinstance(s, dict)]
+                    avg_score = sum(scores)/len(scores) if scores else 0.0
+                    max_score = max(scores) if scores else 0.0
+                    min_score = min(scores) if scores else 0.0
+                    files = [s.get("filename", "Unknown") for s in segments]
+                    unique_files = []
+                    seen_files = set()
+                    for f in files:
+                        if f not in seen_files:
+                            seen_files.add(f)
+                            unique_files.append(f)
+                    diversity = (len(unique_files)/len(files)) if files else 0.0
+                    # Simple confidence proxy
+                    top = max_score if scores else 0.0
+                    std = (sum((sc-avg_score)**2 for sc in scores)/len(scores))**0.5 if scores else 0.0
+                    confidence = top * (1 - min(std / top, 0.5)) if top > 0 else 0.0
+                    
+                    # Enhanced metrics display for summaries
+                    metrics_label = "Auto Retrieval (Enhanced for Summary)" if is_summary else "Auto Retrieval"
+                    yield f"\n\n---\n**📊 Response Quality Metrics ({metrics_label}):**\n"
+                    yield f"• **Retrieval Quality:** {avg_score:.3f} (avg), {max_score:.3f} (max)\n"
+                    yield f"• **Result Points Returned:** {len(segments)} segments\n"
+                    if unique_files:
+                        max_list_files = int(os.getenv('METRICS_MAX_FILE_LIST', '12'))
+                        display_files = unique_files[:max_list_files]
+                        files_list_str = ', '.join(display_files)
+                        if len(unique_files) > max_list_files:
+                            files_list_str += ', …'
+                        yield f"• **Source Files Used:** {len(unique_files)} files ({files_list_str})\n"
+                    yield f"• **Confidence (proxy):** {confidence:.3f}/1.0\n"
+                    yield f"• **Source Diversity:** {diversity:.3f}/1.0\n"
+                    if is_summary:
+                        yield f"• **Summary Enhancement:** Used {effective_top_k} results (enhanced from {top_k}) for better coverage\n"
+        except Exception as e:
+            logger.warning(f"auto_answer_stream failed (falling back): {e}")
+            try:
+                resp = self.llm_client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=question,
+                    config=genai_types.GenerateContentConfig(
+                        tools=[rag_search_bound],
+                        system_instruction=system_instruction,
+                    ),
+                )
+                yield (resp.text or "") if resp else ""
+            except Exception as e2:
+                yield f"Answer generation failed: {e2}"
+
+    # ------------------------------------------------------------------
+    # Legacy synchronous methods (for backward compatibility)
+    # ------------------------------------------------------------------
     def query(self, request: QueryRequest) -> QueryResponse:
         try:
             dense_query = self.embedder.embed_dense_query(request.question)
@@ -56,11 +431,17 @@ class QueryService:
             # Calculate evaluation metrics
             eval_metrics = self._calculate_evaluation_metrics(request.question, results, sources)
             
-            answer, reasoning = self._synthesize_answer(request.question, sources)
+            # Extract selected files for function calling
+            selected_files = None
+            if request.filters and "selected_files" in request.filters:
+                selected_files = request.filters["selected_files"]
+            
+            # Use function calling for answer generation instead of legacy synthesis
+            answer = self.auto_answer(request.question, selected_files, request.top_k)
             return QueryResponse(
                 answer=answer, 
                 sources=sources, 
-                reasoning=reasoning,
+                reasoning="Generated using function calling",
                 evaluation_metrics=eval_metrics
             )
         except Exception as e:
@@ -237,90 +618,85 @@ class QueryService:
         unique_ratio = len(set(filenames)) / len(filenames)
         return float(min(unique_ratio, 1.0))
 
-    # --- Adaptive answer style ---------------------------------------------------------
-    def _determine_answer_style(self, question: str) -> Dict[str, Any]:
-        """Heuristically choose answer brevity & format based on question complexity.
+    # --- Lightweight intent classifiers for streaming bypass ------------------------
+    def _is_identity_q(self, question: str) -> bool:
+        if not question:
+            return False
+        q = question.lower()
+        triggers = ["who are you", "your name", "what is your name", "who is ira", "introduce yourself", "what are you"]
+        return any(t in q for t in triggers)
 
-        Returns dict with: style, max_words, instructions.
-        """
-        q = question.strip()
-        words = q.split()
-        wlen = len(words)
-        lower = q.lower()
-        technical_triggers = [
-            'architecture','implementation','algorithm','optimize','design',
-            'compare','difference','advantages','disadvantages','tradeoff',
-            'pipeline','embedding','vector','latency','scalability','throughput',
-            'explain','detailed','detail','steps','process','workflow'
+    def _is_chitchat(self, question: str) -> bool:
+        if not question:
+            return False
+        q = question.strip().lower()
+        greetings = {"hi", "hey", "hello", "hola", "yo", "sup", "hiya"}
+        if q in greetings:
+            return True
+        phrases = ["good morning", "good afternoon", "good evening", "how are you", "how's it going", "what's up"]
+        if any(q.startswith(p) for p in phrases):
+            return True
+        return False
+
+    def _is_summary_request(self, question: str) -> bool:
+        """Detect if the question is asking for a summary or overview that would benefit from diverse sources."""
+        if not question:
+            return False
+        q = question.lower()
+        summary_triggers = [
+            "summarize", "summary", "summarise", "overview", "key points", "main points",
+            "what are the", "what do the documents", "give me an overview", "provide a summary",
+            "what information", "what topics", "what content", "what is covered",
+            "compile", "consolidate", "aggregate", "comprehensive view"
         ]
-        multi_clause = any(tok in lower for tok in [' and ',' vs ',';','? ']) or lower.count('?') > 1
-        has_technical = any(t in lower for t in technical_triggers)
+        return any(trigger in q for trigger in summary_triggers)
 
-        if wlen <= 6 and not has_technical:
+    def _get_enhanced_top_k_for_summary(self, base_top_k: int) -> int:
+        """Get enhanced top_k for summary requests to ensure better diversity."""
+        # For summary requests, significantly increase the number of results
+        enhanced_k = max(base_top_k * 3, 15)  # At least triple, minimum 15
+        max_k = int(os.getenv("SUMMARY_MAX_TOP_K", "25"))  # Configurable max
+        return min(enhanced_k, max_k)
+
+    # --- Answer style classification (brevity-first) ---------------------------------
+    def _classify_answer_style(self, question: str) -> Dict[str, Any]:
+        """Return answer style config emphasizing brevity unless explicit detail requested.
+
+        Labels:
+          minimal: very short greeting / 1-liner (<= 25 words)
+          concise: default informative answer (<= 60 words)
+          detailed: only when user explicitly requests depth (<= 180 words)
+        """
+        q = (question or "").strip().lower()
+        if not q:
+            return {"label": "minimal", "max_words": 25, "directive": "Respond with one short sentence."}
+        detail_triggers = [
+            "detailed", "in detail", "elaborate", "elaboration", "comprehensive", "full explanation",
+            "full answer", "deep dive", "in depth", "step by step", "thorough", "explain how", "explain why",
+        ]
+        if any(t in q for t in detail_triggers):
             return {
-                'style': 'ultra_short',
-                'max_words': 25,
-                'instructions': (
-                    'Provide ONE plain-language sentence (max 25 words). '
-                    'Answer directly, no bullets, no markdown headers, no extra context.'
-                )
+                "label": "detailed",
+                "max_words": int(os.getenv("STYLE_DETAILED_MAX_WORDS", "180")),
+                "directive": "Provide a structured but tight explanation; avoid fluff; include only source-grounded specifics."
             }
-        if wlen <= 12 and (not has_technical) and not multi_clause:
+        # Extremely short or greeting-like
+        if len(q.split()) <= 6 and not any(k in q for k in ["why", "how", "compare", "difference"]):
             return {
-                'style': 'short',
-                'max_words': 45,
-                'instructions': (
-                    'Provide at most TWO concise sentences (max 45 words total) in layman terms. '
-                    'Avoid bullets unless absolutely necessary. No unnecessary preamble.'
-                )
+                "label": "minimal",
+                "max_words": int(os.getenv("STYLE_MINIMAL_MAX_WORDS", "25")),
+                "directive": "One crisp sentence; no preamble or bullets."
             }
-        # Expanded but still bounded
+        # Default concise style
         return {
-            'style': 'expanded',
-            'max_words': 90,
-            'instructions': (
-                'Provide a compact answer (max 90 words). Use 2-4 short bullet points if listing facts; '
-                'otherwise 2-3 tight sentences. Plain language, define any technical term briefly.'
-            )
+            "label": "concise",
+            "max_words": int(os.getenv("STYLE_CONCISE_MAX_WORDS", "60")),
+            "directive": "Answer directly in 1-3 short sentences; only add a bullet list if enumerating 3+ distinct points."
         }
 
-    def _synthesize_answer(self, question: str, sources: List[Dict[str, Any]]):
-        """Synchronous answer generation (non-stream path)."""
-        if not self.llm_client:
-            return ("LLM not configured. Provide GOOGLE API credentials to enable answer synthesis.",
-                    "No reasoning available (LLM disabled).")
-        # Identity / meta question shortcut (avoid hallucination constraint conflict)
-        if self._is_meta_identity_question(question):
-            return (self._identity_answer(), "Meta identity response")
-        if not sources:
-            ql = question.lower()
-            if any(g in ql for g in ['hi','hello','hey','good morning','good afternoon','good evening']):
-                return ("Hello! I'm IRA. Please upload or select documents so I can answer with context.", "No documents available")
-            return (f"I can't answer '{question}' yet because no documents are available. Upload/select some and ask again.", "No documents available")
-        context_block = self._build_context(sources)
-        style = self._determine_answer_style(question)
-        system_instruction = self._system_instruction(style)
-        prompt = (
-            f"{system_instruction}\n"
-            f"Question: {question}\n"
-            f"Answer style directive: {style['instructions']}\n"
-            f"Hard word limit: {style['max_words']} words. Do not exceed.\n"
-            "If a fact is not present verbatim in the sources, state that it's not available instead of guessing.\n"
-            "Never invent names or people not explicitly present.\n\n"
-            f"Sources (verbatim snippets):\n{context_block}\n\nAnswer:" )
-        try:
-            chat = self.llm_client.chats.create(model="gemini-2.5-flash")
-            stream = chat.send_message_stream(prompt)
-            parts = []
-            for chunk in stream:
-                if hasattr(chunk, 'text') and chunk.text:
-                    parts.append(chunk.text)
-            answer = ''.join(parts).strip()
-            reasoning = "Sources used: " + ", ".join({s.get('filename','Unknown') for s in sources})
-            return answer, reasoning
-        except Exception as e:
-            logger.warning(f"LLM synthesis failed: {e}")
-            return ("Answer generation failed.", str(e))
+
+
+
         
     def stream_answer(self, request: QueryRequest):
         """Yields answer tokens incrementally using Gemini streaming."""
@@ -372,12 +748,12 @@ class QueryService:
                 return
             
             context_block = self._build_context(sources)
-            style = self._determine_answer_style(request.question)
+            style = self._classify_answer_style(request.question)
             system_instruction = self._system_instruction(style)
             prompt = (
                 f"{system_instruction}\n"
                 f"Question: {request.question}\n"
-                f"Answer style directive: {style['instructions']}\n"
+                f"Answer style directive: {style['directive']}\n"
                 f"Hard word limit: {style['max_words']} words.\n"
                 "If question is brief, respond with a single concise layman sentence. If detailed, give a succinct structured answer without fluff.\n"
                 "If a detail (like a teammate name) is not in sources, explicitly say it's not specified in the provided documents.\n"
@@ -438,6 +814,21 @@ class QueryService:
             logger.warning(f"Streaming LLM answer failed: {e}")
             yield f"I apologize, but I encountered an error while processing your request: {str(e)}"
 
+    def stream_answer_with_function_calling(self, request: QueryRequest) -> Generator[str, None, None]:
+        """New streaming method that uses function calling instead of manual RAG."""
+        if not self.is_available():
+            yield "LLM not configured."
+            return
+
+        # Extract selected files from request
+        selected_files = None
+        if request.filters and "selected_files" in request.filters:
+            selected_files = request.filters["selected_files"]
+
+        # Use the function calling streaming method
+        for chunk in self.auto_answer_stream(request.question, selected_files, request.top_k):
+            yield chunk
+
     # --- System instruction -----------------------------------------------------------
     def _system_instruction(self, style: Dict[str, Any]) -> str:
         """Return a single authoritative system instruction for IRA.
@@ -455,6 +846,26 @@ class QueryService:
         return (
             "You are IRA (Information Resource Assistant). A focused retrieval QA agent that strictly grounds every statement in the supplied source snippets."
         )
+
+    # --- Main streaming interface with function calling support -----------------------
+    def stream_answer_auto(self, request: QueryRequest, use_function_calling: bool = True) -> Generator[str, None, None]:
+        """Main streaming interface that can use either function calling or legacy approach.
+        
+        Args:
+            request: QueryRequest with question, filters, and top_k
+            use_function_calling: If True, uses Gemini function calling; if False, uses legacy manual RAG
+            
+        Yields:
+            Answer chunks with response quality metrics
+        """
+        if use_function_calling:
+            # Use the new function calling approach
+            for chunk in self.stream_answer_with_function_calling(request):
+                yield chunk
+        else:
+            # Use the legacy approach
+            for chunk in self.stream_answer(request):
+                yield chunk
 
     # --- Meta identity detection ------------------------------------------------------
     def _is_meta_identity_question(self, question: str) -> bool:
